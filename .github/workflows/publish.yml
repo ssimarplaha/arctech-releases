@@ -1,0 +1,128 @@
+# Copy to .github/workflows/publish.yml in ssimarplaha/arctech-releases.
+name: Public macOS releases
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful macOS distribution run ID in private ssimarplaha/arctech
+        required: true
+        type: string
+      promote_stable:
+        description: Promote after both anonymous public installations pass
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: public-macos-release
+  cancel-in-progress: false
+jobs:
+  prerelease:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: macos-release
+    permissions:
+      contents: write
+      actions: read
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      source_commit: ${{ steps.source.outputs.source_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+      - name: Fetch only the reviewed private source run's qualification artifacts
+        id: source
+        env:
+          ARCTECH_SOURCE_READ_TOKEN: ${{ secrets.ARCTECH_SOURCE_READ_TOKEN }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: node scripts/broker.mjs download "$SOURCE_RUN_ID" artifacts
+      - name: Validate the complete public asset set as data
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+        run: node scripts/broker.mjs assemble artifacts public-assets
+      - name: Publish every asset together as an immutable prerelease
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MACOS_RELEASE_POLICY_TOKEN: ${{ secrets.MACOS_RELEASE_POLICY_TOKEN }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+        run: node scripts/broker.mjs stage public-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reviewed-public-assets
+          path: public-assets/*
+          if-no-files-found: error
+          retention-days: 14
+  public-download:
+    needs: prerelease
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            arch: arm64
+          - runner: macos-26-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions: {}
+    steps:
+      - name: Anonymous public installer and fresh installation without system Node
+        shell: bash
+        env:
+          VERSION: ${{ needs.prerelease.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.prerelease.outputs.source_commit }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          export HOME="$RUNNER_TEMP/arctech-public-home"
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+          mkdir -p "$HOME"
+          curl --fail --location --retry 3 "https://github.com/ssimarplaha/arctech-releases/releases/download/v$VERSION/install.sh" -o "$RUNNER_TEMP/public-install.sh"
+          /bin/bash "$RUNNER_TEMP/public-install.sh" --version "$VERSION" --no-modify-path
+          release="$HOME/.local/share/arctech/current"
+          trap '"$HOME/.local/bin/arctech" stop >/dev/null 2>&1 || true' EXIT
+          "$HOME/.local/bin/arctech" start
+          "$HOME/.local/bin/arctech" status
+          "$HOME/.local/bin/arctech" open --print > "$RUNNER_TEMP/public-open.json"
+          PLAYWRIGHT_BROWSERS_PATH=0 "$release/runtime/bin/node" "$release/scripts/macos/validate.mjs" "$release" --smoke --report "$RUNNER_TEMP/public-$ARCH.json"
+          "$HOME/.local/bin/arctech" stop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-download-${{ matrix.arch }}
+          path: ${{ runner.temp }}/public-${{ matrix.arch }}.json
+          if-no-files-found: error
+  promote:
+    if: inputs.promote_stable
+    needs: [prerelease, public-download]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: macos-release
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: reviewed-public-assets
+          path: public-assets
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: public-download-*
+          path: public-assets
+          merge-multiple: true
+      - name: Promote the same immutable assets after both public installs pass
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MACOS_RELEASE_POLICY_TOKEN: ${{ secrets.MACOS_RELEASE_POLICY_TOKEN }}
+          SOURCE_COMMIT: ${{ needs.prerelease.outputs.source_commit }}
+        run: node scripts/broker.mjs promote public-assets
